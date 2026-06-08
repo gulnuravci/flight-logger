@@ -45,7 +45,7 @@ export default function FlightList() {
         {!loading && error && (
           <div className="flex items-center gap-2">
             <Badge variant="dot" color="red">Can't reach Pico</Badge>
-            <UnstyledButton onClick={loadFlights} className="text-sm text-blue-400 underline">
+            <UnstyledButton onClick={() => loadFlights()} className="text-sm text-blue-400 underline">
               Retry
             </UnstyledButton>
           </div>
