@@ -65,3 +65,12 @@ void logger_write(uint32_t timestamp_ms,
 void logger_sync(void) {
     if (file_open) f_sync(&log_file);
 }
+
+void logger_close(void) {
+    if (file_open) {
+        f_sync(&log_file);
+        f_close(&log_file);
+        file_open = false;
+        row_count = 0;
+    }
+}

@@ -21,3 +21,7 @@ void logger_write(uint32_t timestamp_ms,
 
 // Explicit flush — call before power-off or at the end of a flight.
 void logger_sync(void);
+
+// Flush and close the current log file. Safe to call if no file is open.
+// After this, logger_init() can be called again to start a new flight.
+void logger_close(void);
