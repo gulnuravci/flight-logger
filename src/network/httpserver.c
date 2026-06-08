@@ -18,7 +18,7 @@
 
 #define HTTP_PORT        80
 #define REQ_BUF_SIZE    1024  // JS fetch() sends larger headers than direct navigation
-#define FILE_CHUNK_SIZE 512
+#define FILE_CHUNK_SIZE 2048  // larger chunks → fewer FatFS reads per second
 
 static const char *CORS =
     "Access-Control-Allow-Origin: *\r\n"
@@ -40,7 +40,15 @@ typedef struct {
     uint8_t         chunk[FILE_CHUNK_SIZE];
 } http_conn_t;
 
-static http_conn_t s_conn;
+#define MAX_CONNS 4
+static http_conn_t s_conns[MAX_CONNS];
+
+static http_conn_t *alloc_conn(void) {
+    for (int i = 0; i < MAX_CONNS; i++) {
+        if (!s_conns[i].pcb) return &s_conns[i];
+    }
+    return NULL;
+}
 
 // ---- helpers ----------------------------------------------------------------
 
@@ -66,6 +74,20 @@ static void close_conn(http_conn_t *conn) {
         tcp_close(conn->pcb);
         conn->pcb = NULL;
     }
+}
+
+// ---- MIME type helper -------------------------------------------------------
+
+static const char *mime_type(const char *path) {
+    const char *dot = strrchr(path, '.');
+    if (!dot) return "application/octet-stream";
+    if (strcmp(dot, ".html") == 0 || strcmp(dot, ".htm") == 0) return "text/html; charset=utf-8";
+    if (strcmp(dot, ".js")   == 0) return "application/javascript";
+    if (strcmp(dot, ".css")  == 0) return "text/css";
+    if (strcmp(dot, ".svg")  == 0) return "image/svg+xml";
+    if (strcmp(dot, ".ico")  == 0) return "image/x-icon";
+    if (strcmp(dot, ".json") == 0) return "application/json";
+    return "application/octet-stream";
 }
 
 // ---- API handlers (called from main loop — FatFS safe) ---------------------
@@ -141,6 +163,56 @@ static void handle_flight(struct tcp_pcb *pcb, http_conn_t *conn, int id) {
     conn->streaming = true;
 }
 
+// Serve a file from the SD card "app/" directory.
+// URL path "/" and any path without an extension (React Router routes like
+// "/flight/001") fall back to "app/index.html" so client-side routing works.
+static void handle_static(struct tcp_pcb *pcb, http_conn_t *conn,
+                           const char *url_path) {
+    char fpath[128];
+
+    // Determine whether the URL looks like a real file (has an extension).
+    const char *dot   = strrchr(url_path, '.');
+    const char *slash = strrchr(url_path, '/');
+    bool has_ext = dot && (!slash || dot > slash);
+
+    if (!has_ext || strcmp(url_path, "/") == 0) {
+        // SPA route or bare "/" → serve the app shell from SD root
+        snprintf(fpath, sizeof(fpath), "index.htm");
+    } else {
+        // Strip leading "/" — FatFS paths are relative to root, no leading slash
+        snprintf(fpath, sizeof(fpath), "%s", url_path + 1);
+    }
+
+    if (f_open(&conn->file, fpath, FA_READ) != FR_OK) {
+        // File not found → SPA fallback to index.html
+        if (strcmp(fpath, "index.htm") == 0 ||
+            f_open(&conn->file, "index.htm", FA_READ) != FR_OK) {
+            tcp_send(pcb,
+                "HTTP/1.0 404 Not Found\r\n"
+                "Content-Type: text/plain\r\n"
+                "Content-Length: 9\r\n"
+                "Connection: close\r\n"
+                "\r\nNot found");
+            tcp_output(pcb);
+            return;
+        }
+        snprintf(fpath, sizeof(fpath), "index.htm");
+    }
+    conn->file_open = true;
+
+    static char hdr[256];
+    snprintf(hdr, sizeof(hdr),
+        "HTTP/1.0 200 OK\r\n"
+        "Content-Type: %s\r\n"
+        "Content-Length: %lu\r\n"
+        "Connection: close\r\n"
+        "\r\n",
+        mime_type(fpath), (unsigned long)f_size(&conn->file));
+    tcp_send(pcb, hdr);
+    tcp_output(pcb);
+    conn->streaming = true;
+}
+
 // ---- dispatch (called from main loop after headers are complete) -----------
 
 static void dispatch(http_conn_t *conn) {
@@ -176,11 +248,9 @@ static void dispatch(http_conn_t *conn) {
         int id = atoi(path + 12);
         handle_flight(pcb, conn, id);
     } else {
-        tcp_send(pcb,
-            "HTTP/1.0 404 Not Found\r\n"
-            "Content-Type: text/plain\r\n"
-            "Content-Length: 9\r\n\r\nNot found");
-        tcp_output(pcb);
+        // Serve the built PWA from the SD card "app/" directory.
+        // Falls back to app/index.html for React Router client-side routes.
+        handle_static(pcb, conn, path);
     }
 }
 
@@ -240,12 +310,13 @@ static err_t on_accept(void *arg, struct tcp_pcb *client, err_t err) {
     (void)arg;
     if (err != ERR_OK || !client) return ERR_VAL;
 
-    if (s_conn.pcb) { tcp_abort(client); return ERR_ABRT; }
+    http_conn_t *conn = alloc_conn();
+    if (!conn) { tcp_abort(client); return ERR_ABRT; }
 
-    memset(&s_conn, 0, sizeof(s_conn));
-    s_conn.pcb = client;
+    memset(conn, 0, sizeof(*conn));
+    conn->pcb = client;
 
-    tcp_arg(client, &s_conn);
+    tcp_arg(client, conn);
     tcp_recv(client, on_recv);
     tcp_sent(client, on_sent);
     tcp_err(client, on_error);
@@ -256,7 +327,7 @@ static err_t on_accept(void *arg, struct tcp_pcb *client, err_t err) {
 // ---- public API -------------------------------------------------------------
 
 void httpserver_init(void) {
-    memset(&s_conn, 0, sizeof(s_conn));
+    memset(s_conns, 0, sizeof(s_conns));
 
     struct tcp_pcb *pcb = tcp_new_ip_type(IPADDR_TYPE_ANY);
     if (!pcb) return;
@@ -267,51 +338,53 @@ void httpserver_init(void) {
 }
 
 void httpserver_poll(void) {
-    // Step 1: dispatch request once headers are complete (FatFS safe — main loop)
-    if (s_conn.headers_complete && !s_conn.dispatched && s_conn.pcb) {
-        s_conn.dispatched = true;
-        cyw43_arch_lwip_begin();
-        dispatch(&s_conn);
-        cyw43_arch_lwip_end();
-    }
+    for (int i = 0; i < MAX_CONNS; i++) {
+        http_conn_t *conn = &s_conns[i];
+        if (!conn->pcb) continue;
 
-    // Step 2: stream file data chunk by chunk
-    if (!s_conn.streaming || !s_conn.pcb || !s_conn.file_open) return;
-
-    cyw43_arch_lwip_begin();
-    u16_t avail = tcp_sndbuf(s_conn.pcb);
-    cyw43_arch_lwip_end();
-
-    if (avail < FILE_CHUNK_SIZE) return;
-
-    UINT br;
-    FRESULT fr = f_read(&s_conn.file, s_conn.chunk, FILE_CHUNK_SIZE, &br);
-
-    if (fr != FR_OK || br == 0) {
-        // EOF — close file first (FatFS must be outside lwIP lock), then close TCP.
-        // IMPORTANT: do NOT set streaming=false before acquiring the lock — if
-        // on_sent fires in that window it would call close_conn → f_close from
-        // IRQ context (unsafe SPI) and double-close the PCB.
-        f_close(&s_conn.file);
-        s_conn.file_open = false;
-
-        cyw43_arch_lwip_begin();
-        s_conn.streaming = false;   // set inside lock so on_sent can't race us
-        if (s_conn.pcb) {
-            struct tcp_pcb *pcb = s_conn.pcb;
-            s_conn.pcb = NULL;
-            tcp_arg(pcb,  NULL);
-            tcp_recv(pcb, NULL);
-            tcp_sent(pcb, NULL);
-            tcp_err(pcb,  NULL);
-            tcp_close(pcb);
+        // Step 1: dispatch once headers are complete (FatFS safe — main loop)
+        if (conn->headers_complete && !conn->dispatched) {
+            conn->dispatched = true;
+            cyw43_arch_lwip_begin();
+            dispatch(conn);
+            cyw43_arch_lwip_end();
         }
-        cyw43_arch_lwip_end();
-        return;
-    }
 
-    cyw43_arch_lwip_begin();
-    tcp_write(s_conn.pcb, s_conn.chunk, (u16_t)br, TCP_WRITE_FLAG_COPY);
-    tcp_output(s_conn.pcb);
-    cyw43_arch_lwip_end();
+        // Step 2: stream file data chunk by chunk
+        if (!conn->streaming || !conn->file_open) continue;
+
+        cyw43_arch_lwip_begin();
+        u16_t avail = tcp_sndbuf(conn->pcb);
+        cyw43_arch_lwip_end();
+
+        if (avail < FILE_CHUNK_SIZE) continue;
+
+        UINT br;
+        FRESULT fr = f_read(&conn->file, conn->chunk, FILE_CHUNK_SIZE, &br);
+
+        if (fr != FR_OK || br == 0) {
+            // EOF — close file first (FatFS outside lwIP lock), then close TCP.
+            f_close(&conn->file);
+            conn->file_open = false;
+
+            cyw43_arch_lwip_begin();
+            conn->streaming = false;
+            if (conn->pcb) {
+                struct tcp_pcb *pcb = conn->pcb;
+                conn->pcb = NULL;
+                tcp_arg(pcb,  NULL);
+                tcp_recv(pcb, NULL);
+                tcp_sent(pcb, NULL);
+                tcp_err(pcb,  NULL);
+                tcp_close(pcb);
+            }
+            cyw43_arch_lwip_end();
+            continue;
+        }
+
+        cyw43_arch_lwip_begin();
+        tcp_write(conn->pcb, conn->chunk, (u16_t)br, TCP_WRITE_FLAG_COPY);
+        tcp_output(conn->pcb);
+        cyw43_arch_lwip_end();
+    }
 }

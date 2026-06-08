@@ -235,6 +235,14 @@ int main(void) {
             next_blink = make_timeout_time_ms(500);
         }
 
-        sleep_ms(100);
+        // Poll the network for the rest of this 100 ms tick.
+        // Using a tight loop (instead of sleep_ms) lets the WiFi stack
+        // process ACKs immediately, keeping the TCP send buffer full and
+        // making large static file transfers (JS/CSS) finish quickly.
+        absolute_time_t tick_end = make_timeout_time_ms(100);
+        while (!time_reached(tick_end)) {
+            cyw43_arch_poll();
+            httpserver_poll();
+        }
     }
 }

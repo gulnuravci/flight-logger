@@ -19,7 +19,7 @@
 
 #define FF_CODE_PAGE     437  // US ASCII
 
-#define FF_USE_LFN       0    // no long filename support — 8.3 names only
+#define FF_USE_LFN       0    // no long filename support — 8.3 names only (LFN causes RP2350 relocation error)
 #define FF_MAX_LFN       255
 #define FF_LFN_UNICODE   0
 #define FF_LFN_BUF       255
