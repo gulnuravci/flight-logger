@@ -1,0 +1,14 @@
+{
+    "cmake.buildDirectory": "${workspaceFolder}/build",
+    "cmake.configureArgs": [
+        "-DPICO_BOARD=pico2_w",
+        "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
+        "-DCMAKE_TOOLCHAIN_FILE=${env:HOME}/pico/pico-sdk/cmake/preload/toolchains/pico_arm_cortex_m33_gcc.cmake"
+    ],
+    "cmake.environment": {
+        "PICO_SDK_PATH": "${env:HOME}/pico/pico-sdk"
+    },
+    "clangd.arguments": [
+        "--query-driver=/opt/homebrew/bin/arm-none-eabi-*"
+    ]
+}

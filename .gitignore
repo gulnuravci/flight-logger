@@ -1,0 +1,13 @@
+build/
+.cache/
+docs/*.aux
+docs/*.log
+docs/*.toc
+docs/*.out
+
+# macOS
+.DS_Store
+
+# KiCad lock files and local history
+*.lck
+hardware/**/.history/
