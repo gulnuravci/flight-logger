@@ -4,7 +4,7 @@ import FlightDetail from './pages/FlightDetail'
 
 export default function App() {
   return (
-    <BrowserRouter>
+    <BrowserRouter basename={import.meta.env.BASE_URL}>
       <Routes>
         <Route path="/" element={<FlightList />} />
         <Route path="/flight/:id" element={<FlightDetail />} />
